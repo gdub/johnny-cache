@@ -20,7 +20,10 @@ from .testapp.models import (
 
 
 # put tests in here to be included in the testing suite
-__all__ = ['MultiDbTest', 'SingleModelTest', 'MultiModelTest', 'TransactionSupportTest', 'BlackListTest', 'TransactionManagerTestCase']
+__all__ = ['MultiDbTest', 'SingleModelTest', 'MultiModelTest', 'TransactionSupportTest',
+           'BlackListTest', 'TransactionManagerTestCase']
+if hasattr(transaction, 'atomic'):
+    __all__.append('AtomicTest')
 
 
 def is_multithreading_safe(db_using=None):
@@ -742,6 +745,7 @@ class TransactionSupportTest(TransactionQueryCacheBase):
     def test_savepoint_rollback(self):
         """Tests rollbacks of savepoints"""
         if not connection.features.uses_savepoints or connection.vendor == 'sqlite':
+            print("\n  Skipping test requiring savepoint support.")
             return
         self.assertFalse(is_managed())
         self.assertFalse(transaction.is_dirty())
@@ -804,6 +808,7 @@ class TransactionSupportTest(TransactionQueryCacheBase):
         The release actually pushes the savepoint back into the dirty stack,
         but at the point it was saved in the transaction"""
         if not connection.features.uses_savepoints:
+            print("\n  Skipping test requiring savepoint support.")
             return
         self.assertFalse(is_managed())
         self.assertFalse(transaction.is_dirty())
@@ -835,6 +840,176 @@ class TransactionSupportTest(TransactionQueryCacheBase):
         self.assertEqual(g.title, "In the Void")
         managed(False)
         transaction.leave_transaction_management()
+
+
+class AtomicTest(TransactionSupportTest):
+
+    def test_transaction_commit(self):
+        """Test transaction support in Johnny."""
+        if not is_multithreading_safe(db_using='default'):
+            print("\n  Skipping test requiring multiple threads.")
+            return
+
+        self.assertFalse(is_managed())
+        self.assertFalse(transaction.is_dirty())
+        cache.local.clear()
+        q = Queue()
+        other = lambda x: self._run_threaded(x, q)
+        # load some data
+        start = Genre.objects.get(id=1)
+        other('Genre.objects.get(id=1)')
+        hit, ostart = q.get()
+        # these should be the same and should have hit cache
+        self.assertTrue(hit)
+        self.assertEqual(ostart, start)
+        with transaction.atomic():
+            start.title = 'Jackie Chan Novels'
+            # local invalidation, this key should hit the localstore!
+            nowlen = len(cache.local)
+            start.save()
+            self.assertNotEqual(nowlen, len(cache.local))
+            # perform a read OUTSIDE this transaction... it should still see the
+            # old gen key, and should still find the "old" data
+            other('Genre.objects.get(id=1)')
+            hit, ostart = q.get()
+            self.assertTrue(hit)
+            self.assertNotEqual(ostart.title, start.title)
+        # now that we commit, we push the localstore keys out;  this should be
+        # a cache miss, because we never read it inside the previous transaction
+        other('Genre.objects.get(id=1)')
+        hit, ostart = q.get()
+        self.assertFalse(hit)
+        self.assertEqual(ostart.title, start.title)
+
+    def test_transaction_rollback(self):
+        if not is_multithreading_safe(db_using='default'):
+            print("\n  Skipping test requiring multiple threads.")
+            return
+
+        self.assertFalse(is_managed())
+        self.assertFalse(transaction.is_dirty())
+        cache.local.clear()
+        q = Queue()
+        other = lambda x: self._run_threaded(x, q)
+
+        # load some data
+        start = Genre.objects.get(id=1)
+        start_title = start.title
+        other('Genre.objects.get(id=1)')
+        hit, ostart = q.get()
+        # these should be the same and should have hit cache
+        self.assertTrue(hit)
+        self.assertEqual(ostart, start)
+        try:
+            with transaction.atomic():
+                start.title = 'Jackie Chan Novels'
+                # local invalidation, this key should hit the localstore!
+                nowlen = len(cache.local)
+                start.save()
+                self.assertNotEqual(nowlen, len(cache.local))
+                # perform a read OUTSIDE this transaction... it should still see the
+                # old gen key, and should still find the "old" data
+                other('Genre.objects.get(id=1)')
+                hit, ostart = q.get()
+                self.assertTrue(hit)
+                self.assertEqual(ostart.title, start_title)
+                # perform a READ inside the transaction;  this should hit the localstore
+                # but not the outside!
+                nowlen = len(cache.local)
+                start2 = Genre.objects.get(id=1)
+                self.assertEqual(start2.title, start.title)
+                self.assertTrue(len(cache.local) > nowlen)
+                # Raise an exception so that atomic performs a rollback.
+                raise IntegrityError('Triggering rollback')
+        except IntegrityError:
+            pass
+        else:
+            self.fail("IntegrityError was not raised")
+        # we rollback, and flush all johnny keys related to this transaction
+        # subsequent gets should STILL hit the cache in the other thread
+        # and indeed, in this thread.
+
+        self.assertFalse(transaction.is_dirty())
+        other('Genre.objects.get(id=1)')
+        hit, ostart = q.get()
+        self.assertTrue(hit)
+        start = Genre.objects.get(id=1)
+        self.assertEqual(ostart.title, start.title)
+
+    def test_savepoint_rollback(self):
+        """Tests rollbacks of savepoints"""
+        if not connection.features.uses_savepoints or connection.vendor == 'sqlite':
+            print("\n  Skipping test requiring savepoint support.")
+            return
+        self.assertFalse(is_managed())
+        self.assertFalse(transaction.is_dirty())
+        cache.local.clear()
+
+        g = Genre.objects.get(pk=1)
+        g.title = "Before transaction"
+        g.save()
+        try:
+            with transaction.atomic():
+                g = Genre.objects.get(pk=1)
+                self.assertEqual(g.title, "Before transaction")
+                g.title = "In outer atomic"
+                g.save()
+                try:
+                    with transaction.atomic():
+                        g = Genre.objects.get(pk=1)
+                        self.assertEqual(g.title, "In outer atomic")
+                        g.title = "In inner atomic"
+                        g.save()
+                        g = Genre.objects.get(pk=1)
+                        self.assertEqual(g.title, "In inner atomic")
+                        raise IntegrityError("Triggering rollback of inner atomic block")
+                except IntegrityError:
+                    pass
+                else:
+                    self.fail("IntegrityError was not raised")
+                g = Genre.objects.get(pk=1)
+                self.assertEqual(g.title, "In outer atomic")
+                raise IntegrityError("Triggering rollback of outer atomic block")
+        except IntegrityError:
+            pass
+        else:
+            self.fail("IntegrityError was not raised")
+        g = Genre.objects.get(pk=1)
+        self.assertEqual(g.title, "Before transaction")
+
+    def test_savepoint_commit(self):
+        """Tests a transaction commit (release)
+        The release actually pushes the savepoint back into the dirty stack,
+        but at the point it was saved in the transaction"""
+        if not connection.features.uses_savepoints:
+            print("\n  Skipping test requiring savepoint support.")
+            return
+        self.assertFalse(is_managed())
+        self.assertFalse(transaction.is_dirty())
+        cache.local.clear()
+
+        with transaction.atomic():
+            g = Genre.objects.get(pk=1)
+            g.title = "Adventures in Savepoint World"
+            g.save()
+            g = Genre.objects.get(pk=1)
+            self.assertEqual(g.title, "Adventures in Savepoint World")
+            with transaction.atomic():
+                # Entering into atomic block should create a savepoint.
+                g.title = "In the Void"
+                g.save()
+                #should be a database hit because of save in savepoint
+                with self.assertNumQueries(1):
+                    g = Genre.objects.get(pk=1)
+                self.assertEqual(g.title, "In the Void")
+            #should be a cache hit against the dirty store
+            with self.assertNumQueries(0):
+                g = Genre.objects.get(pk=1)
+            self.assertEqual(g.title, "In the Void")
+        #should have been pushed up to cache store
+        with self.assertNumQueries(0):
+            g = Genre.objects.get(pk=1)
+        self.assertEqual(g.title, "In the Void")
 
 
 class TransactionManagerTestCase(base.TransactionJohnnyTestCase):

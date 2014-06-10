@@ -14,10 +14,17 @@ env:
   - DJANGO=1.3.7  PSYCOPG2=2.4.1 DJANGO_REDIS=a0806e34d1643887840cf3688933327b649c7a5a
   - DJANGO=1.4.10 PSYCOPG2=2.5.2 DJANGO_REDIS=3.4
   - DJANGO=1.5.5  PSYCOPG2=2.5.2 DJANGO_REDIS=3.4
-  - DJANGO=1.6.2  PSYCOPG2=2.5.2 DJANGO_REDIS=3.4
+  # For testing, use a patched Django 1.6.x branch.
+  #- DJANGO=1.6.2  PSYCOPG2=2.5.2 DJANGO_REDIS=3.4
+  - DJANGO=https://github.com/gdub/django/archive/1.6.x-atomic-patch.zip#django PSYCOPG2=2.5.2 DJANGO_REDIS=3.4
 
 install:
-  - pip install Django==$DJANGO psycopg2==$PSYCOPG2 coveralls --use-mirrors
+  - if [[ $DJANGO == http* ]]; then
+      pip install $DJANGO;
+    else
+      pip install Django==$DJANGO;
+    fi
+  - pip install psycopg2==$PSYCOPG2 coveralls
   - pip install -e git+https://github.com/niwibe/django-redis@$DJANGO_REDIS#egg=django-redis
   - pip install http://cdn.mysql.com/Downloads/Connector-Python/mysql-connector-python-1.2.2.zip#egg=mysql
   - if [[ $TRAVIS_PYTHON_VERSION == 3.2 ]]
